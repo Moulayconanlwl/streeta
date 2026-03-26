@@ -62,3 +62,25 @@ RE_RU_DOM = re.compile(
 
 # ── PATTERN 10: Fallback — any isolated number ───────────────────────────
 RE_FALLBACK = re.compile(r"(?<![a-zA-Z\d])(\d+[a-zA-Z]?)(?!\d)", re.IGNORECASE | re.UNICODE)
+
+# --- BLOCKED PATTERNS -----------------------------------------------------
+
+# Floor numbers / levels / ordinals
+RE_FLOOR = re.compile(
+    r"\b(\d+(st|nd|rd|th)|\d+\s*(etg|étage|etage|piso|piano|andar|kat|og|stock|floor|level))\b",
+    re.IGNORECASE
+)
+
+# PO Box / BP / Apartado / Casilla / Postfach
+RE_POBOX = re.compile(
+    r"\b(po\s*box|p\.?o\.?\s*box|bp|boite\s+postale|apartado|casilla|postfach)\s*\d+",
+    re.IGNORECASE
+)
+
+
+
+# Ordinals (1er, 2eme, 3ème, 4th…)
+RE_ORDINAL = re.compile(
+    r"\b\d+(er|eme|ème|e|st|nd|rd|th)\b",
+    re.IGNORECASE
+)

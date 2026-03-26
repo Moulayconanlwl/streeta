@@ -55,7 +55,20 @@ def _normalize_number(raw: str) -> str:
     raw = re.sub(r"\s*/\s*", "/", raw)
     raw = re.sub(r"\s+", " ", raw)
     return raw
+def _remove_blocked_patterns(text: str) -> str:
+    """Remove floor numbers, PO Box, ordinals, and postal codes."""
+    from .patterns import RE_FLOOR, RE_POBOX,  RE_ORDINAL
 
+    # Remove floor numbers
+    text = RE_FLOOR.sub("", text)
+
+    # Remove PO Box / BP / Apartado / Postfach
+    text = RE_POBOX.sub("", text)
+
+    # Remove ordinals (1st, 2nd, 1er…)
+    text = RE_ORDINAL.sub("", text)
+
+    return re.sub(r"\s+", " ", text).strip()
 
 class InternationalBuildingNumberExtractor:
     """
@@ -79,7 +92,8 @@ class InternationalBuildingNumberExtractor:
         parts = [_clean(str(addr_ln3 or "")), _clean(str(addr_ln4 or ""))]
         parts = [p for p in parts if p]
         full_address = " ".join(parts)
-
+        # Remove floor numbers, PO boxes, postal codes, ordinals
+        full_address = _remove_blocked_patterns(full_address)
         if not full_address:
             return ExtractionResult(
                 raw_address="", building_number=None,
