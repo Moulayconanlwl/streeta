@@ -5,15 +5,9 @@ InternationalBuildingNumberExtractor
 Multi-pass, language-aware extractor of building / house numbers
 from free-form international address strings.
 
-Extraction pipeline (in order of priority):
-  1. Inline  "No." / "nº" / "nr." pattern anywhere in string      → very reliable
-  2. After-comma pattern  "… , 123"                               → reliable
-  3. Russian dom-indicator  "д. 15" / "дом 15"                   → script-specific
-  4. CJK hierarchical pattern                                      → script-specific
-  5. Language-aware: starts-with-digit → NUMBER-FIRST             → high confidence
-  6. Language-aware: known prefix detected → NUMBER-LAST          → good confidence
-  7. Trailing-number heuristic                                     → moderate
-  8. Fallback: first isolated number found                         → low confidence
+ADDITION:
+- number_index → index (0-based) of first character of the building number
+                 in the concatenation LN3 + LN4
 """
 
 import re
@@ -29,19 +23,27 @@ from .patterns import (
 from .language_detector import detect_number_position
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Result object
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class ExtractionResult:
     raw_address:      str
     building_number:  Optional[str]
-    confidence:       float           # 0.0 – 1.0
+    number_index:     Optional[int]   # 0-based index in raw_address
+    confidence:       float
     lang_code:        Optional[str]
-    number_position:  str             # 'first' | 'last' | 'complex' | 'unknown'
+    number_position:  str
     method:           str
     notes:            list = field(default_factory=list)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _clean(text: str) -> str:
-    """Normalize whitespace and remove zero-width chars."""
     text = unicodedata.normalize("NFC", text)
     text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -49,195 +51,168 @@ def _clean(text: str) -> str:
 
 
 def _normalize_number(raw: str) -> str:
-    """Normalize extracted number string: trim spaces around separators."""
     raw = raw.strip()
     raw = re.sub(r"\s*-\s*", "-", raw)
     raw = re.sub(r"\s*/\s*", "/", raw)
     raw = re.sub(r"\s+", " ", raw)
     return raw
-def _remove_blocked_patterns(text: str) -> str:
-    """Remove floor numbers, PO Box, ordinals, and postal codes."""
-    from .patterns import RE_FLOOR, RE_POBOX,  RE_ORDINAL
 
-    # Remove floor numbers
-    text = RE_FLOOR.sub("", text)
 
-    # Remove PO Box / BP / Apartado / Postfach
-    text = RE_POBOX.sub("", text)
+def _mask_blocked_patterns(text: str) -> str:
+    """
+    Mask (do not remove) floor numbers / PO Box / ordinals with spaces.
 
-    # Remove ordinals (1st, 2nd, 1er…)
-    text = RE_ORDINAL.sub("", text)
+    This keeps character positions aligned with the original LN3+LN4 string.
+    """
+    from .patterns import RE_FLOOR, RE_POBOX, RE_ORDINAL
 
-    return re.sub(r"\s+", " ", text).strip()
+    def _mask(regex, s):
+        return regex.sub(lambda m: " " * len(m.group(0)), s)
+
+    text = _mask(RE_FLOOR, text)
+    text = _mask(RE_POBOX, text)
+    text = _mask(RE_ORDINAL, text)
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extractor
+# ─────────────────────────────────────────────────────────────────────────────
 
 class InternationalBuildingNumberExtractor:
     """
-    Thread-safe, stateless extractor.  Instantiate once and reuse.
+    Thread-safe, stateless extractor.
     """
 
     def extract(self, addr_ln3: str, addr_ln4: str = "") -> ExtractionResult:
-        """
-        Concatenate CLIADDLN3_LA + CLIADDLN4_LA and extract the building number.
 
-        Parameters
-        ----------
-        addr_ln3 : str   Content of CLIADDLN3_LA column
-        addr_ln4 : str   Content of CLIADDLN4_LA column (optional)
-
-        Returns
-        -------
-        ExtractionResult dataclass
-        """
-        # ── 0. Build combined address ──────────────────────────────────────
-        parts = [_clean(str(addr_ln3 or "")), _clean(str(addr_ln4 or ""))]
+        # ── 0. Build concatenated Omega address ───────────────────────────
+        parts = [_clean(addr_ln3 or ""), _clean(addr_ln4 or "")]
         parts = [p for p in parts if p]
-        full_address = " ".join(parts)
-        # Remove floor numbers, PO boxes, postal codes, ordinals
-        full_address = _remove_blocked_patterns(full_address)
-        if not full_address:
+        raw_concat = " ".join(parts)
+
+        if not raw_concat:
             return ExtractionResult(
-                raw_address="", building_number=None,
-                confidence=0.0, lang_code=None,
-                number_position="unknown", method="empty input",
+                raw_address="",
+                building_number=None,
+                number_index=None,
+                confidence=0.0,
+                lang_code=None,
+                number_position="unknown",
+                method="empty input",
             )
 
-        # ── 1. Inline No. / nº / nr. / # anywhere ─────────────────────────
-        m = RE_INLINE_NO.search(full_address)
+        # Mask patterns but keep indices
+        masked = _mask_blocked_patterns(raw_concat)
+
+        # Allow regex matching from first meaningful char
+        stripped = masked.lstrip()
+        lead_offset = len(masked) - len(stripped)
+        work = stripped
+
+        # Helper to build result safely
+        def _result(num, m, confidence, lang, pos, method, notes=None):
+            return ExtractionResult(
+                raw_address=raw_concat,
+                building_number=num,
+                number_index=lead_offset + m.start(1),
+                confidence=confidence,
+                lang_code=lang,
+                number_position=pos,
+                method=method,
+                notes=notes or [],
+            )
+
+        # ── 1. Inline No / nº / nr / # ────────────────────────────────────
+        m = RE_INLINE_NO.search(work)
         if m:
-            num = _normalize_number(m.group(1))
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.97, lang_code=None,
-                number_position="inline", method="inline No./nº/nr. pattern",
+            return _result(
+                _normalize_number(m.group(1)), m,
+                0.97, None, "inline",
+                "inline No./nº/nr. pattern"
             )
 
-        # ── 2. After-comma pattern ─────────────────────────────────────────
-        m = RE_AFTER_COMMA.search(full_address)
+        # ── 2. After-comma ────────────────────────────────────────────────
+        m = RE_AFTER_COMMA.search(work)
         if m:
-            num = _normalize_number(m.group(1))
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.93, lang_code=None,
-                number_position="after_comma", method="after-comma number pattern",
+            return _result(
+                _normalize_number(m.group(1)), m,
+                0.93, None, "after_comma",
+                "after-comma number pattern"
             )
 
-        # ── 3. Russian dom indicator ───────────────────────────────────────
-        m = RE_RU_DOM.search(full_address)
+        # ── 3. Russian дом ────────────────────────────────────────────────
+        m = RE_RU_DOM.search(work)
         if m:
-            num = _normalize_number(m.group(1))
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.96, lang_code="RU",
-                number_position="last", method="Russian dom (д./дом) indicator",
+            return _result(
+                _normalize_number(m.group(1)), m,
+                0.96, "RU", "last",
+                "Russian dom (д./дом) indicator"
             )
 
-        # ── 4. Japanese chome-ban-go ───────────────────────────────────────
-        m = RE_JP_CHOME.search(full_address)
+        # ── 4. JP / CJK / KO ───────────────────────────────────────────────
+        m = RE_JP_CHOME.search(work)
         if m:
             num = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.95, lang_code="JP",
-                number_position="complex", method="Japanese chome-ban-go",
-            )
-        m = RE_JP_SIMPLE.search(full_address)
+            return _result(num, m, 0.95, "JP", "complex", "Japanese chome-ban-go")
+
+        m = RE_JP_SIMPLE.search(work)
         if m:
             num = f"{m.group(1)}-{m.group(2)}"
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.93, lang_code="JP",
-                number_position="complex", method="Japanese ban-go",
-            )
+            return _result(num, m, 0.93, "JP", "complex", "Japanese ban-go")
 
-        # ── 4b. Chinese 号 ─────────────────────────────────────────────────
-        m = RE_ZH_NUMBER.search(full_address)
+        m = RE_ZH_NUMBER.search(work)
         if m:
-            return ExtractionResult(
-                raw_address=full_address, building_number=m.group(1),
-                confidence=0.90, lang_code="ZH",
-                number_position="complex", method="Chinese 号 indicator",
-            )
+            return _result(m.group(1), m, 0.90, "ZH", "complex", "Chinese 号 indicator")
 
-        # ── 4c. Korean 번지/호 ─────────────────────────────────────────────
-        m = RE_KO_NUMBER.search(full_address)
+        m = RE_KO_NUMBER.search(work)
         if m:
-            return ExtractionResult(
-                raw_address=full_address, building_number=m.group(1),
-                confidence=0.90, lang_code="KO",
-                number_position="complex", method="Korean address indicator",
-            )
+            return _result(m.group(1), m, 0.90, "KO", "complex", "Korean address indicator")
 
         # ── 5. Language detection ──────────────────────────────────────────
-        detection = detect_number_position(full_address)
-        position  = detection["position"]
-        lang_code = detection["lang_code"]
+        detection = detect_number_position(work)
+        position = detection["position"]
+        lang = detection["lang_code"]
 
-        # ── 5a. NUMBER-FIRST ───────────────────────────────────────────────
+        # ── 5a. Number-first ───────────────────────────────────────────────
         if position == "first":
-            m = RE_NUMBER_FIRST.match(full_address)
+            m = RE_NUMBER_FIRST.match(work)
             if m:
-                num = _normalize_number(m.group(1))
-                return ExtractionResult(
-                    raw_address=full_address, building_number=num,
-                    confidence=0.95, lang_code=lang_code,
-                    number_position="first",
-                    method=f"number-first ({detection['method']})",
+                return _result(
+                    _normalize_number(m.group(1)), m,
+                    0.95, lang, "first",
+                    f"number-first ({detection['method']})"
                 )
 
-        # ── 5b. NUMBER-LAST ────────────────────────────────────────────────
+        # ── 5b. Number-last ────────────────────────────────────────────────
         if position in ("last", "unknown"):
-            m = RE_NUMBER_LAST.search(full_address)
+            m = RE_NUMBER_LAST.search(work)
             if m:
-                num = _normalize_number(m.group(1))
-                conf = 0.90 if position == "last" else 0.72
-                return ExtractionResult(
-                    raw_address=full_address, building_number=num,
-                    confidence=conf, lang_code=lang_code,
-                    number_position="last",
-                    method=f"number-last ({detection['method']})",
+                return _result(
+                    _normalize_number(m.group(1)), m,
+                    0.90 if position == "last" else 0.72,
+                    lang, "last",
+                    f"number-last ({detection['method']})"
                 )
 
-        # ── 6. Trailing number heuristic (catches DE compound words) ───────
-        m = re.search(r"[\s,]+(\d+[a-zA-Z]?(?:/[a-zA-Z])?)[\s,]*$", full_address)
-        if m:
-            num = _normalize_number(m.group(1))
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.75, lang_code=lang_code,
-                number_position="last",
-                method="trailing number heuristic",
+        # ── 6. Fallback ────────────────────────────────────────────────────
+        iters = list(RE_FALLBACK.finditer(work))
+        if iters:
+            pick = iters[0]
+            return _result(
+                pick.group(1), pick,
+                0.45, lang, "fallback",
+                "last-resort isolated number",
+                ["Low confidence — multiple numbers found"] if len(iters) > 1 else []
             )
 
-        # ── 7. number-first fallback when detection was uncertain ──────────
-        m = RE_NUMBER_FIRST.match(full_address)
-        if m:
-            num = _normalize_number(m.group(1))
-            return ExtractionResult(
-                raw_address=full_address, building_number=num,
-                confidence=0.65, lang_code=lang_code,
-                number_position="first",
-                method="number-first fallback",
-            )
-
-        # ── 8. Last resort: first isolated number ─────────────────────────
-        candidates = RE_FALLBACK.findall(full_address)
-        if candidates:
-            # Filter out obvious postal codes or year-like 4+ digit numbers if
-            # there are shorter alternatives
-            short = [c for c in candidates if len(re.sub(r"\D", "", c)) <= 5]
-            pick = short[0] if short else candidates[0]
-            return ExtractionResult(
-                raw_address=full_address, building_number=pick,
-                confidence=0.45, lang_code=lang_code,
-                number_position="fallback",
-                method="last-resort isolated number",
-                notes=["Low confidence — multiple numbers found; first selected"]
-                      if len(candidates) > 1 else [],
-            )
-
-        # ── 9. Not found ───────────────────────────────────────────────────
+        # ── 7. Not found ───────────────────────────────────────────────────
         return ExtractionResult(
-            raw_address=full_address, building_number=None,
-            confidence=0.0, lang_code=lang_code,
-            number_position="unknown", method="no number found",
+            raw_address=raw_concat,
+            building_number=None,
+            number_index=None,
+            confidence=0.0,
+            lang_code=lang,
+            number_position="unknown",
+            method="no number found",
         )

@@ -91,7 +91,8 @@ def process_dat(
 
         # Append a final column with the building number or empty string
         bn_value = result.building_number if result.building_number else ""
-        fields_out = fields + [bn_value]
+        bn_pos = (result.number_index + 1) if result.number_index is not None else ""
+        fields_out = fields + [bn_value, bn_pos]
 
         out_rows.append(fields_out)
 
